@@ -1,0 +1,82 @@
+[
+  {
+    "question": "What is the capital of France?",
+    "options": ["London", "Paris", "Berlin", "Madrid"],
+    "answer_idx": 1,
+    "hint": "It sits on the Seine river.",
+    "explanation": "Paris has been the capital of France since 987 AD and is home to the Eiffel Tower.",
+    "category": "Geography"
+  },
+  {
+    "question": "Which planet is known as the Red Planet?",
+    "options": ["Venus", "Jupiter", "Mars", "Saturn"],
+    "answer_idx": 2,
+    "hint": "It has a reddish appearance due to iron oxide on its surface.",
+    "explanation": "Mars appears red because its surface is covered in iron oxide (rust).",
+    "category": "Science"
+  },
+  {
+    "question": "Who wrote 'Romeo and Juliet'?",
+    "options": ["Charles Dickens", "William Shakespeare", "Mark Twain", "Jane Austen"],
+    "answer_idx": 1,
+    "hint": "He's often called the Bard of Avon.",
+    "explanation": "William Shakespeare wrote Romeo and Juliet around 1594–1596.",
+    "category": "Literature"
+  },
+  {
+    "question": "What is the chemical symbol for Gold?",
+    "options": ["Go", "Gd", "Au", "Ag"],
+    "answer_idx": 2,
+    "hint": "It comes from the Latin word 'Aurum'.",
+    "explanation": "Au comes from Aurum, the Latin name for gold.",
+    "category": "Science"
+  },
+  {
+    "question": "How many continents are there on Earth?",
+    "options": ["5", "6", "7", "8"],
+    "answer_idx": 2,
+    "hint": "Africa, Antarctica, Asia, Australia, Europe, North America, South America.",
+    "explanation": "The 7 continents are Africa, Antarctica, Asia, Australia/Oceania, Europe, North America, and South America.",
+    "category": "Geography"
+  },
+  {
+    "question": "What is the largest ocean on Earth?",
+    "options": ["Atlantic Ocean", "Indian Ocean", "Arctic Ocean", "Pacific Ocean"],
+    "answer_idx": 3,
+    "hint": "It covers more than 30% of Earth's surface.",
+    "explanation": "The Pacific Ocean is the largest, covering about 165 million square kilometers.",
+    "category": "Geography"
+  },
+  {
+    "question": "Which programming language is known as the 'language of the web'?",
+    "options": ["Python", "Java", "JavaScript", "C++"],
+    "answer_idx": 2,
+    "hint": "It runs natively in browsers.",
+    "explanation": "JavaScript is the only programming language that runs natively in web browsers, making it essential for web development.",
+    "category": "Technology"
+  },
+  {
+    "question": "What year did World War II end?",
+    "options": ["1943", "1944", "1945", "1946"],
+    "answer_idx": 2,
+    "hint": "Japan surrendered after atomic bombs were dropped.",
+    "explanation": "WWII ended in 1945 — Victory in Europe (VE Day) on May 8 and Victory over Japan (VJ Day) on August 15.",
+    "category": "History"
+  },
+  {
+    "question": "What is the speed of light (approx.) in km/s?",
+    "options": ["200,000 km/s", "300,000 km/s", "400,000 km/s", "150,000 km/s"],
+    "answer_idx": 1,
+    "hint": "It's approximately 3 × 10^8 m/s.",
+    "explanation": "The speed of light in a vacuum is approximately 299,792 km/s, commonly rounded to 300,000 km/s.",
+    "category": "Science"
+  },
+  {
+    "question": "Which element has the atomic number 1?",
+    "options": ["Helium", "Oxygen", "Hydrogen", "Carbon"],
+    "answer_idx": 2,
+    "hint": "It's the lightest and most abundant element in the universe.",
+    "explanation": "Hydrogen (H) has atomic number 1 — it has one proton and is the simplest element.",
+    "category": "Science"
+  }
+]
