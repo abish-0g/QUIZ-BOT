@@ -22,6 +22,12 @@ RAILWAY FIX:
     For persistence on Railway, mount a volume at /data and set:
     DATABASE_URL=sqlite:////data/quiz_bot.db
   - Never tries to parse a Postgres URL as a file path.
+
+ACCESS FIX:
+  - Anyone can now create quizzes (/newquiz, /addq) in DM — no whitelist.
+  - Starting/stopping a quiz INSIDE a group (/startquiz, /stopquiz) still
+    requires the user to be an admin of that specific group. This is
+    unchanged and enforced by is_admin() at the point of use.
 """
 
 import asyncio, json, logging, os, sys, time, random
@@ -572,7 +578,14 @@ async def is_admin(bot, chat_id, user_id):
         return isinstance(m, (ChatMemberAdministrator, ChatMemberOwner))
     except: return False
 
-def dm_allowed(uid): return not SUPER_ADMINS or uid in SUPER_ADMINS
+# ── ACCESS FIX ────────────────────────────────────────────────
+# Previously this only allowed users listed in SUPER_ADMINS to create
+# quizzes in DM, which locked everyone else out unless that env var
+# was left blank. Quiz *creation* is now open to anyone; only
+# *conducting* a quiz inside a specific group still requires that
+# user to be an admin of that group (see is_admin() above, used in
+# /startquiz and /stopquiz).
+def dm_allowed(uid): return True
 
 
 # ══════════════════════════════════════════════════════════════
