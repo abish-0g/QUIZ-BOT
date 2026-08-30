@@ -758,13 +758,15 @@ need to type /startquiz manually.
 #  /start  — handles both plain start and deep-links
 # ══════════════════════════════════════════════════════════════
 @router.message(CommandStart())
-async def cmd_start(msg: Message, state: FSMContext):
-    # ── Handle deep-link: ?start=doq_<quiz_id>  (solo quiz in DM via share link) ──
+async def cmd_start(msg: Message, state: FSMContext, bot: Bot):
     text = msg.text or ""
     parts = text.split(maxsplit=1)
     payload = parts[1] if len(parts) > 1 else ""
 
+    # ── Handle deep-link: ?start=doq_<quiz_id>  (solo quiz — only makes sense in DM) ──
     if payload.startswith("doq_") and payload[4:].isdigit():
+        if msg.chat.type != "private":
+            await msg.reply("📩 Open this link in my DM to start the quiz solo."); return
         qid  = int(payload[4:])
         quiz = await db.get_quiz(qid)
         if not quiz:
@@ -784,7 +786,15 @@ async def cmd_start(msg: Message, state: FSMContext):
         await qm.start(qid, msg.chat.id, None, msg.from_user.id, qids, timer)
         return
 
-    # ── Normal /start ──
+    # ── /start typed inside a GROUP (or a specific section/topic): the DM-only
+    #    menu (Create Quiz, Add Questions, etc.) doesn't belong here. Instead,
+    #    behave exactly like /startquiz — show this admin's quiz sets right
+    #    there and ask which one to run, scoped to that section. ──
+    if msg.chat.type != "private":
+        await cmd_startquiz(msg, bot)
+        return
+
+    # ── Normal /start (DM) ──
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🆕 Create New Quiz Set", callback_data="m:new")],
         [InlineKeyboardButton(text="📋 My Quiz Sets",        callback_data="m:list")],
