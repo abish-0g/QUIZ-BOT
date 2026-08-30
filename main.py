@@ -28,13 +28,28 @@ ACCESS FIX:
   - Starting/stopping a quiz INSIDE a group (/startquiz, /stopquiz) still
     requires the user to be an admin of that specific group. This is
     unchanged and enforced by is_admin() at the point of use.
+
+SECTION FIX (forum/topic groups):
+  - Previously section detection relied on Telegram's `is_topic_message`
+    flag, which is unreliable — it caused the bot to only ever run in the
+    group's General section, ignoring named topics.
+  - Now section detection uses `chat.is_forum` + `message_thread_id`
+    directly, so /startquiz works correctly in ANY section, not just General.
+
+DM GROUP+SECTION PICKER:
+  - Telegram's Bot API has no endpoint to list a forum's existing topics,
+    so the bot remembers groups/sections as it sees them (new messages,
+    topic-created events, or the first time /startquiz is run in a section).
+  - From DM, an admin can now: pick a quiz → pick a group (from groups the
+    bot has seen where they're an admin) → pick a section (from sections
+    the bot has seen in that group) → quiz launches directly there.
 """
 
 import asyncio, json, logging, os, sys, time, random
 from typing import Optional, Dict, List, Tuple
 
 import aiosqlite
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -42,7 +57,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery, PollAnswer,
+    Message, CallbackQuery, PollAnswer, ChatMemberUpdated,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
@@ -109,11 +124,20 @@ def is_spam(uid):
     _spam[uid] = now; return False
 
 # ── Thread/topic helpers ──
+# FIX: `is_topic_message` is unreliable across Telegram/aiogram versions and
+# was causing the bot to always treat messages as "General" (tid=None), even
+# when sent inside a named section/topic. We now key off `chat.is_forum`
+# together with `message_thread_id` directly, which correctly identifies
+# ANY section, not just General.
 def thread_id(msg: Message):
-    return msg.message_thread_id if msg.is_topic_message else None
+    if getattr(msg.chat, "is_forum", False):
+        return msg.message_thread_id
+    return None
 
 def thread_id_cb(cb: CallbackQuery):
-    return cb.message.message_thread_id if cb.message and cb.message.is_topic_message else None
+    if cb.message and getattr(cb.message.chat, "is_forum", False):
+        return cb.message.message_thread_id
+    return None
 
 # ── Formatting ──
 def acc(c, t): return round(c * 100 / t, 1) if t else 0.0
@@ -246,6 +270,18 @@ class DB:
             wrong       INTEGER DEFAULT 0,
             score       INTEGER DEFAULT 0,
             PRIMARY KEY(session_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS groups(
+            chat_id    INTEGER PRIMARY KEY,
+            title      TEXT,
+            is_forum   INTEGER DEFAULT 0,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS topics(
+            chat_id    INTEGER NOT NULL,
+            thread_id  INTEGER NOT NULL,
+            name       TEXT,
+            PRIMARY KEY(chat_id, thread_id)
         );
         """)
         await self.c.commit()
@@ -412,6 +448,85 @@ class DB:
         )
         row = await cur.fetchone()
         return {"participants": row[0] or 0, "total_correct": row[1] or 0, "total_wrong": row[2] or 0}
+
+    # ── Groups & Sections (for the DM group/section picker) ──
+    async def upsert_group(self, chat_id, title, is_forum):
+        await self.c.execute(
+            "INSERT INTO groups(chat_id,title,is_forum,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP)"
+            " ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,"
+            " is_forum=excluded.is_forum, updated_at=CURRENT_TIMESTAMP",
+            (chat_id, title, int(bool(is_forum)))
+        )
+        await self.c.commit()
+
+    async def remove_group(self, chat_id):
+        await self.c.execute("DELETE FROM groups WHERE chat_id=?", (chat_id,))
+        await self.c.execute("DELETE FROM topics WHERE chat_id=?", (chat_id,))
+        await self.c.commit()
+
+    async def get_all_groups(self):
+        cur = await self.c.execute("SELECT * FROM groups ORDER BY title")
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def get_group(self, chat_id):
+        cur = await self.c.execute("SELECT * FROM groups WHERE chat_id=?", (chat_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def upsert_topic(self, chat_id, thread_id, name):
+        await self.c.execute(
+            "INSERT INTO topics(chat_id,thread_id,name) VALUES(?,?,?)"
+            " ON CONFLICT(chat_id,thread_id) DO UPDATE SET name=excluded.name",
+            (chat_id, thread_id, name)
+        )
+        await self.c.commit()
+
+    async def get_topics(self, chat_id):
+        cur = await self.c.execute("SELECT * FROM topics WHERE chat_id=? ORDER BY thread_id", (chat_id,))
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def has_topic(self, chat_id, thread_id):
+        cur = await self.c.execute(
+            "SELECT 1 FROM topics WHERE chat_id=? AND thread_id=?", (chat_id, thread_id)
+        )
+        return await cur.fetchone() is not None
+
+
+# ══════════════════════════════════════════════════════════════
+#  GROUP / SECTION TRACKER
+#  (Telegram's Bot API has no "list forum topics" endpoint, so the bot
+#   learns about groups and their sections passively — from any message
+#   it receives, from topic-created/renamed service messages, and from
+#   its own add/remove events. This is what powers the DM picker below.)
+# ══════════════════════════════════════════════════════════════
+class GroupTrackerMiddleware(BaseMiddleware):
+    def __init__(self, db: DB):
+        self.db = db
+        super().__init__()
+
+    async def __call__(self, handler, event: Message, data):
+        try:
+            chat = event.chat
+            if chat and chat.type in ("group", "supergroup"):
+                is_forum = bool(getattr(chat, "is_forum", False))
+                await self.db.upsert_group(chat.id, chat.title or "Group", is_forum)
+
+                if is_forum and event.message_thread_id:
+                    created = getattr(event, "forum_topic_created", None)
+                    edited  = getattr(event, "forum_topic_edited", None)
+                    if created and created.name:
+                        await self.db.upsert_topic(chat.id, event.message_thread_id, created.name)
+                    elif edited and edited.name:
+                        await self.db.upsert_topic(chat.id, event.message_thread_id, edited.name)
+                    elif not await self.db.has_topic(chat.id, event.message_thread_id):
+                        # Seen a message in this section for the first time but
+                        # missed its creation event — remember it with a generic name.
+                        await self.db.upsert_topic(
+                            chat.id, event.message_thread_id, f"Section #{event.message_thread_id}"
+                        )
+        except Exception as e:
+            logger.error(f"GroupTracker err: {e}")
+        return await handler(event, data)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -626,6 +741,11 @@ HELP = """🤖 <b>Quiz Bot — Guide</b>
 Go into the specific <b>section/topic</b> and type /startquiz
 → quiz runs only in that section!
 
+<b>🏘 Start from DM instead:</b>
+Tap <b>«Start Quiz in Group»</b> in the menu (or on a quiz card) →
+pick the quiz → pick the group → pick the section — done, no
+need to type /startquiz manually.
+
 <b>⏱ Timers:</b> 15s · 30s · 1 min · 2 min · 5 min
 <b>🔀 Shuffle</b> questions toggle per quiz set
 <b>🔴 First tap</b> counts — no changing answers
@@ -669,6 +789,7 @@ async def cmd_start(msg: Message, state: FSMContext):
         [InlineKeyboardButton(text="🆕 Create New Quiz Set", callback_data="m:new")],
         [InlineKeyboardButton(text="📋 My Quiz Sets",        callback_data="m:list")],
         [InlineKeyboardButton(text="➕ Add Questions",        callback_data="m:addq")],
+        [InlineKeyboardButton(text="🏘 Start Quiz in Group",  callback_data="m:startgroup")],
         [InlineKeyboardButton(text="❓ Help",                  callback_data="m:help")],
     ])
     await msg.reply(
@@ -702,8 +823,161 @@ async def m_addq_cb(cb: CallbackQuery, state: FSMContext):
 async def m_help(cb: CallbackQuery):
     await cb.answer(); await cb.message.reply(HELP)
 
+
+# ══════════════════════════════════════════════════════════════
+#  DM GROUP + SECTION PICKER  (quiz → group → section → launch)
+# ══════════════════════════════════════════════════════════════
+async def _show_group_picker(msg, bot: Bot, qid: int, uid: int):
+    """Step: pick which group to start the quiz in (only groups the bot has
+    seen where this user is currently an admin)."""
+    groups = await db.get_all_groups()
+    admin_groups = []
+    for g in groups:
+        try:
+            if await is_admin(bot, g["chat_id"], uid):
+                admin_groups.append(g)
+        except Exception:
+            continue
+
+    add_link = f"https://t.me/{BOT_USERNAME}?startgroup=start"
+
+    if not admin_groups:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Add me to a group", url=add_link)],
+        ])
+        await msg.reply(
+            "🏘 <b>No groups found yet.</b>\n\n"
+            "I only show groups where I'm already present and you're an admin. "
+            "Add me to your group, send one message there (or just open it), "
+            "then come back and tap <b>🏘 Start Quiz in Group</b> again.",
+            reply_markup=kb, disable_web_page_preview=True
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"👥 {g['title']}", callback_data=f"gsel:{qid}:{g['chat_id']}")]
+        for g in admin_groups
+    ]
+    buttons.append([InlineKeyboardButton(text="➕ Add me to another group", url=add_link)])
+    await msg.reply(
+        "🏘 <b>Pick a group to start this quiz in:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        disable_web_page_preview=True
+    )
+
+
+async def _show_section_picker(msg, qid: int, chat_id: int):
+    """Step: pick which section/topic of the chosen group to start in."""
+    group = await db.get_group(chat_id)
+    if not group:
+        await msg.reply("❌ Lost track of that group — try picking it again."); return
+
+    if not group.get("is_forum"):
+        # No sections in a normal group — just confirm and launch into main chat.
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"▶️ Start in «{group['title']}»", callback_data=f"sec:{qid}:{chat_id}:0")]
+        ])
+        await msg.reply(
+            f"📍 <b>{group['title']}</b> doesn't have sections/topics — just one chat.\n\nStart the quiz there?",
+            reply_markup=kb
+        )
+        return
+
+    topics = await db.get_topics(chat_id)
+    buttons = [[InlineKeyboardButton(text="📍 General / Main section", callback_data=f"sec:{qid}:{chat_id}:0")]]
+    for t in topics:
+        buttons.append([InlineKeyboardButton(
+            text=f"🗂 {t['name']}", callback_data=f"sec:{qid}:{chat_id}:{t['thread_id']}"
+        )])
+
+    note = ""
+    if not topics:
+        note = (
+            "\n\n<i>💡 Don't see your section? I can only list sections I've already seen. "
+            "Open that section in the group and send /startquiz there once — after that "
+            "it'll show up here too.</i>"
+        )
+    await msg.reply(
+        f"📚 <b>Pick a section in «{group['title']}»:</b>{note}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.callback_query(F.data == "m:startgroup")
+async def m_startgroup(cb: CallbackQuery, bot: Bot):
+    await cb.answer()
+    uid = cb.from_user.id
+    qs = await db.get_user_quizzes(uid)
+    valid = [q for q in qs if await db.count_questions(q["id"]) > 0]
+    if not valid:
+        await cb.message.reply("❌ You have no quiz sets with questions yet. Create one with /newquiz"); return
+    if len(valid) == 1:
+        await _show_group_picker(cb.message, bot, valid[0]["id"], uid); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📋 {q['title']}", callback_data=f"dmquizpick:{q['id']}")]
+        for q in valid
+    ])
+    await cb.message.reply("📚 <b>Which quiz do you want to start in a group?</b>", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("dmquizpick:"))
+async def cb_dmquizpick(cb: CallbackQuery, bot: Bot):
+    await cb.answer()
+    qid = int(cb.data.split(":")[1])
+    await _show_group_picker(cb.message, bot, qid, cb.from_user.id)
+
+
+@router.callback_query(F.data.startswith("gsel:"))
+async def cb_group_pick(cb: CallbackQuery, bot: Bot):
+    await cb.answer()
+    _, qid, chat_id = cb.data.split(":")
+    qid, chat_id = int(qid), int(chat_id)
+    if not await is_admin(bot, chat_id, cb.from_user.id):
+        await cb.message.reply("⛔ You're not an admin of that group anymore."); return
+    await _show_section_picker(cb.message, qid, chat_id)
+
+
+@router.callback_query(F.data.startswith("sec:"))
+async def cb_section_pick(cb: CallbackQuery, bot: Bot):
+    _, qid, chat_id, tid_enc = cb.data.split(":")
+    qid, chat_id = int(qid), int(chat_id)
+    tid = None if tid_enc == "0" else int(tid_enc)
+
+    if not await is_admin(bot, chat_id, cb.from_user.id):
+        await cb.answer("⛔ You're not an admin there anymore.", show_alert=True); return
+    await cb.answer("✅ Starting…")
+
+    if qm.is_active(chat_id, tid):
+        await cb.message.reply("⚠️ A quiz is already running there! Use /stopquiz in that section first."); return
+
+    q = await db.get_quiz(qid)
+    if not q or q["owner_id"] != cb.from_user.id:
+        await cb.message.reply("❌ Quiz not found or not yours."); return
+    cnt = await db.count_questions(qid)
+    if cnt == 0:
+        await cb.message.reply("❌ No questions in that quiz!"); return
+
+    await cb.message.reply(f"✅ <b>«{q['title']}»</b> is starting there now!")
+    await _launch_in(bot, chat_id, tid, q, cnt, cb.from_user.id)
+
 @router.message(Command("help"))
 async def cmd_help(msg: Message): await msg.reply(HELP)
+
+
+@router.my_chat_member()
+async def track_bot_membership(update: ChatMemberUpdated):
+    """Keep the groups table in sync when the bot is added to / removed from a group."""
+    try:
+        chat = update.chat
+        if chat.type not in ("group", "supergroup"): return
+        status = update.new_chat_member.status
+        if status in ("left", "kicked"):
+            await db.remove_group(chat.id)
+        else:
+            is_forum = bool(getattr(chat, "is_forum", False))
+            await db.upsert_group(chat.id, chat.title or "Group", is_forum)
+    except Exception as e:
+        logger.error(f"my_chat_member track err: {e}")
 
 @router.message(Command("cancel"))
 async def cmd_cancel(msg: Message, state: FSMContext):
@@ -738,10 +1012,9 @@ async def card_start(cb: CallbackQuery):
     await qm.start(qid, cb.message.chat.id, None, cb.from_user.id, qids, timer)
 
 
-# ── FIX 1: "Start in group" now gives a direct deep-link that opens
-#    a group-picker in Telegram, then the admin runs /startquiz there ──
+# ── "Start in group" now shows the group → section picker directly in DM ──
 @router.callback_query(F.data.startswith("card:ingroup:"))
-async def card_ingroup(cb: CallbackQuery):
+async def card_ingroup(cb: CallbackQuery, bot: Bot):
     await cb.answer()
     qid  = int(cb.data.split(":")[2])
     quiz = await db.get_quiz(qid)
@@ -750,29 +1023,7 @@ async def card_ingroup(cb: CallbackQuery):
     cnt = await db.count_questions(qid)
     if cnt == 0:
         await cb.message.reply("❌ No questions yet. Add some with /addq"); return
-
-    # startgroup= payload is passed to /start in the group context.
-    # We encode the quiz id so when the bot is added it can show a hint,
-    # but the actual quiz launch still requires /startquiz from the admin.
-    start_in_group_link = f"https://t.me/{BOT_USERNAME}?startgroup=sq_{qid}"
-    add_link            = f"https://t.me/{BOT_USERNAME}?startgroup=start"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Choose group & start this quiz", url=start_in_group_link)],
-        [InlineKeyboardButton(text="➕ Add bot to a new group",          url=add_link)],
-    ])
-    await cb.message.reply(
-        f"🏘 <b>Start «{quiz['title']}» in a group</b>\n\n"
-        f"1️⃣ Tap <b>«Choose group & start this quiz»</b> below\n"
-        f"   → Telegram opens a group-picker\n"
-        f"2️⃣ Select the group you want\n"
-        f"3️⃣ As a group admin, type <code>/startquiz</code>\n"
-        f"   ↳ <b>«{quiz['title']}»</b> will be at the top of the list\n\n"
-        f"<b>Forum/topic groups:</b> go <b>inside the specific section</b> first,\n"
-        f"then /startquiz — quiz runs <b>only in that section!</b>",
-        reply_markup=kb,
-        disable_web_page_preview=True
-    )
+    await _show_group_picker(cb.message, bot, qid, cb.from_user.id)
 
 
 @router.callback_query(F.data.startswith("card:stats:"))
@@ -1356,11 +1607,14 @@ async def main():
     logger.info(f"Bot: @{BOT_USERNAME}")
     qm  = QuizManager(bot, db)
     dp  = Dispatcher(storage=MemoryStorage())
+    dp.message.outer_middleware(GroupTrackerMiddleware(db))
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Bot is polling…")
     try:
-        await dp.start_polling(bot, allowed_updates=["message","callback_query","poll_answer"])
+        await dp.start_polling(
+            bot, allowed_updates=["message", "callback_query", "poll_answer", "my_chat_member"]
+        )
     finally:
         await db.close(); await bot.session.close(); logger.info("Bot stopped.")
 
